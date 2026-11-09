@@ -21,3 +21,5 @@ This PC-side dashboard communicates with the board through its MCU-Link USB seri
 5. Select the board's COM port, usually COM3, and click Connect.
 
 The dashboard sends the existing `LED RED`, `LED GREEN`, `LED BLUE`, `LED OFF`, `TEMP?`, and `UPTIME?` commands. It refreshes uptime every second and temperature every five seconds.
+
+Use **Show Graph** to open the temperature chart. The horizontal axis is elapsed time (`hh:mm:ss`) since the graph was last refreshed; the vertical axis is the MCU temperature in Celsius. **Refresh Graph** clears its samples, restarts elapsed time, and requests a fresh temperature sample. The chart plots the MCU's internal temperature, not room temperature.

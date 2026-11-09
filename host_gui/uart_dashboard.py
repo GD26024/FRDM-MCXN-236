@@ -1,9 +1,14 @@
+from collections import deque
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.ticker import FuncFormatter
 import serial
 from serial.tools import list_ports
 
@@ -11,24 +16,32 @@ from serial.tools import list_ports
 BAUD_RATE = 115200
 POLL_INTERVAL_MS = 1000
 TEMPERATURE_INTERVAL_TICKS = 5
+MAX_TEMPERATURE_SAMPLES = 3600
 
 
 class UartDashboard:
     def __init__(self, root):
         self.root = root
         self.root.title("FRDM-MCXN236 Dashboard")
-        self.root.geometry("680x500")
-        self.root.minsize(600, 440)
+        self.root.geometry("720x560")
+        self.root.minsize(620, 480)
 
         self.connection = None
         self.reader_stop = None
         self.messages = queue.Queue()
         self.poll_ticks = 0
+        self.temperature_samples = deque(maxlen=MAX_TEMPERATURE_SAMPLES)
+        self.graph_started_at = time.monotonic()
+        self.graph_window = None
+        self.graph_axes = None
+        self.graph_line = None
+        self.graph_canvas = None
         self.port_var = tk.StringVar()
         self.connection_var = tk.StringVar(value="Disconnected")
         self.led_var = tk.StringVar(value="Unknown")
         self.temperature_var = tk.StringVar(value="--.- C")
         self.uptime_var = tk.StringVar(value="--:--:--")
+        self.graph_status_var = tk.StringVar(value="No temperature samples yet")
 
         self._build_ui()
         self.refresh_ports()
@@ -60,7 +73,7 @@ class UartDashboard:
         ttk.Label(connection, text="Serial port:").pack(side="left", padx=(0, 8))
         self.port_box = ttk.Combobox(connection, textvariable=self.port_var, width=18, state="readonly")
         self.port_box.pack(side="left", padx=(0, 8))
-        ttk.Button(connection, text="Refresh", command=self.refresh_ports).pack(side="left", padx=(0, 8))
+        ttk.Button(connection, text="Rescan Ports", command=self.refresh_ports).pack(side="left", padx=(0, 8))
         self.connect_button = ttk.Button(connection, text="Connect", command=self.toggle_connection)
         self.connect_button.pack(side="left")
 
@@ -79,6 +92,17 @@ class UartDashboard:
             ttk.Button(controls, text=label, command=lambda value=command: self.send_command(value)).pack(
                 side="left", padx=(0, 8)
             )
+
+        graph_panel = ttk.Frame(outer, style="Panel.TFrame", padding=12)
+        graph_panel.pack(fill="x", pady=(0, 14))
+        ttk.Label(graph_panel, text="Temperature history", style="Caption.TLabel").pack(anchor="w", pady=(0, 8))
+        graph_controls = ttk.Frame(graph_panel, style="Panel.TFrame")
+        graph_controls.pack(fill="x")
+        ttk.Button(graph_controls, text="Show Graph", command=self.show_temperature_graph).pack(side="left", padx=(0, 8))
+        ttk.Button(graph_controls, text="Refresh Graph", command=self.refresh_temperature_graph).pack(
+            side="left", padx=(0, 12)
+        )
+        ttk.Label(graph_controls, textvariable=self.graph_status_var, style="Caption.TLabel").pack(side="left")
 
         log_panel = ttk.Frame(outer, style="Panel.TFrame", padding=12)
         log_panel.pack(fill="both", expand=True)
@@ -128,6 +152,7 @@ class UartDashboard:
     def initialize_board(self, connection):
         if self.connection is not connection:
             return
+        self._reset_temperature_graph(request_sample=False, log_reset=False)
         self.send_command("LED OFF")
         self.poll_ticks = 0
         self.poll_device(connection)
@@ -191,7 +216,12 @@ class UartDashboard:
 
         temperature = re.search(r"MCU internal temperature:\s*(-?\d+\.\d+) C", line)
         if temperature:
+            temperature_value = float(temperature.group(1))
             self.temperature_var.set(f"{temperature.group(1)} C")
+            elapsed_seconds = time.monotonic() - self.graph_started_at
+            self.temperature_samples.append((elapsed_seconds, temperature_value))
+            self.graph_status_var.set(f"{len(self.temperature_samples)} samples")
+            self.update_temperature_graph()
 
         uptime = re.search(r"(?:Uptime: |SW2 pressed\. Uptime: )(\d+:\d{2}:\d{2})", line)
         if uptime:
@@ -207,6 +237,81 @@ class UartDashboard:
             self.led_var.set("OFF")
         elif "Red LED toggled." in line:
             self.led_var.set("RED toggled")
+
+    @staticmethod
+    def format_elapsed_time(value, _position):
+        total_seconds = max(0, int(value))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def show_temperature_graph(self):
+        if self.graph_window is not None and self.graph_window.winfo_exists():
+            self.graph_window.deiconify()
+            self.graph_window.lift()
+            self.update_temperature_graph()
+            return
+
+        self.graph_window = tk.Toplevel(self.root)
+        self.graph_window.title("Temperature over time")
+        self.graph_window.geometry("820x520")
+        self.graph_window.minsize(600, 380)
+        self.graph_window.protocol("WM_DELETE_WINDOW", self.close_temperature_graph)
+
+        figure = Figure(figsize=(8, 4.8), dpi=100)
+        self.graph_axes = figure.add_subplot(111)
+        self.graph_axes.set_title("MCU Internal Temperature")
+        self.graph_axes.set_xlabel("Elapsed time (hh:mm:ss)")
+        self.graph_axes.set_ylabel("Temperature (C)")
+        self.graph_axes.xaxis.set_major_formatter(FuncFormatter(self.format_elapsed_time))
+        self.graph_axes.grid(True, color="#d9e0e5", linewidth=0.8)
+        self.graph_line, = self.graph_axes.plot([], [], color="#168b83", marker="o", markersize=4, linewidth=1.8)
+
+        self.graph_canvas = FigureCanvasTkAgg(figure, master=self.graph_window)
+        self.graph_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+        self.update_temperature_graph()
+
+    def update_temperature_graph(self):
+        if self.graph_axes is None or self.graph_canvas is None:
+            return
+        if self.graph_window is None or not self.graph_window.winfo_exists():
+            return
+
+        if self.temperature_samples:
+            elapsed, temperatures = zip(*self.temperature_samples)
+            self.graph_line.set_data(elapsed, temperatures)
+            self.graph_axes.relim()
+            self.graph_axes.autoscale_view(scalex=False, scaley=True)
+            self.graph_axes.set_xlim(0, max(5, elapsed[-1] * 1.05))
+        else:
+            self.graph_line.set_data([], [])
+            self.graph_axes.set_xlim(0, 5)
+            self.graph_axes.set_ylim(0, 1)
+
+        self.graph_canvas.draw_idle()
+
+    def refresh_temperature_graph(self):
+        self._reset_temperature_graph(request_sample=True, log_reset=True)
+
+    def _reset_temperature_graph(self, request_sample, log_reset):
+        self.temperature_samples.clear()
+        self.graph_started_at = time.monotonic()
+        self.graph_status_var.set("Waiting for temperature sample")
+        self.update_temperature_graph()
+
+        if log_reset:
+            self._append_log("Temperature graph refreshed; time restarted at 00:00:00.")
+        if request_sample:
+            self.send_command("TEMP?")
+
+    def close_temperature_graph(self):
+        if self.graph_window is not None and self.graph_window.winfo_exists():
+            self.graph_window.destroy()
+        self.graph_window = None
+        self.graph_axes = None
+        self.graph_line = None
+        self.graph_canvas = None
 
     def poll_device(self, connection):
         if self.connection is not connection:
@@ -226,6 +331,7 @@ class UartDashboard:
 
     def close(self):
         self.disconnect()
+        self.close_temperature_graph()
         self.root.destroy()
 
 
