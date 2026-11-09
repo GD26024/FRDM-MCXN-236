@@ -1,0 +1,11 @@
+/debug/
+/release/
+/build/
+/__repo__/
+__pycache__/
+.venv/
+*.py[cod]
+*.elf
+*.bin
+*.hex
+*.map
